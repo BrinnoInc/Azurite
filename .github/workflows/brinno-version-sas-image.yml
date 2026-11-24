@@ -21,6 +21,8 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - name: Test versioned blob and SAS behavior
+        env:
+          NODE_TLS_REJECT_UNAUTHORIZED: "0"
         run: npx mocha --require ts-node/register --no-timeouts --grep @loki --exit tests/blob/apis/blockblob.versioning.test.ts
       - name: Log in to GitHub Container Registry
         env:
@@ -28,5 +30,5 @@ jobs:
         run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Build and publish
         run: |
-          docker build --tag ghcr.io/brinnoinc/azurite:3.38.0-version-sas .
+          docker build --label org.opencontainers.image.source=https://github.com/BrinnoInc/Azurite --tag ghcr.io/brinnoinc/azurite:3.38.0-version-sas .
           docker push ghcr.io/brinnoinc/azurite:3.38.0-version-sas
