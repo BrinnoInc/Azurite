@@ -1,0 +1,32 @@
+name: Brinno version SAS image
+
+on:
+  push:
+    branches:
+      - brinno-version-sas-v3.38.0
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run lint
+      - name: Test versioned blob and SAS behavior
+        run: npx mocha --require ts-node/register --no-timeouts --grep @loki --exit tests/blob/apis/blockblob.versioning.test.ts
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and publish
+        run: |
+          docker build --tag ghcr.io/brinnoinc/azurite:3.38.0-version-sas .
+          docker push ghcr.io/brinnoinc/azurite:3.38.0-version-sas
