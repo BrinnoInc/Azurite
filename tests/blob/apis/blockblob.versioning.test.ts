@@ -2,6 +2,8 @@ import {
   AnonymousCredential,
   BlobClient,
   BlobSASPermissions,
+  BlockBlobClient,
+  PageBlobClient,
   StorageSharedKeyCredential,
   BlobServiceClient,
   generateBlobSASQueryParameters,
@@ -25,6 +27,8 @@ import {
 } from "../../testutils";
 import { SimpleTokenCredential } from "../../simpleTokenCredential";
 import { parseDateFromAssumedString } from "../../../src/blob/utils/utils";
+import { BlobSASResourceType } from "../../../src/blob/authentication/BlobSASResourceType";
+import { generateBlobSASSignature } from "../../../src/blob/authentication/IBlobSASSignatureValues";
 import { AccountModel } from "../../../src/common/account/AccountModel";
 import LokiAccountModelStore from "../../../src/common/account/LokiAccountModelStore";
 
@@ -840,6 +844,217 @@ describe("BlockBlobVersioningAPIs @loki", () => {
     }
   });
 
+  // A version SAS grants the version it names and not the base blob, so an
+  // operation that ignores versionid, and would act on the base blob, is
+  // refused whatever the permissions.
+  it("a SAS for a version does not reach the base blob @loki", async () => {
+    const first = await blockBlobClient.upload("v1", 2);
+    await blockBlobClient.upload("v2", 2);
+    const sasUrl = await blockBlobClient
+      .withVersion(first.versionId!)
+      .generateSasUrl({
+        permissions: BlobSASPermissions.parse("racwt"),
+        expiresOn: new Date(Date.now() + 60 * 60 * 1000)
+      });
+    const sasClient = new BlockBlobClient(
+      sasUrl,
+      newPipeline(new AnonymousCredential(), { retryOptions: { maxTries: 1 } })
+    );
+
+    for (const request of [
+      () => sasClient.setMetadata({ key: "value" }),
+      () => sasClient.upload("v3", 2),
+      () => sasClient.getBlockList("committed")
+    ]) {
+      await assert.rejects(
+        request(),
+        (err: RestError) =>
+          err.statusCode === 403 &&
+          err.code === "AuthorizationResourceTypeMismatch"
+      );
+    }
+
+    const current = await blockBlobClient.getProperties();
+    assert.deepStrictEqual(current.metadata, {});
+    assert.strictEqual(
+      await bodyToString(await blockBlobClient.download(), 2),
+      "v2"
+    );
+  });
+
+  // Deleting a version takes the Delete version permission, x; d alone, which
+  // deletes a base blob, does not.
+  it("a SAS for a version deletes it with x and not d @loki", async () => {
+    const first = await blockBlobClient.upload("v1", 2);
+    const second = await blockBlobClient.upload("v2", 2);
+    const sasClientWith = async (permissions: string) =>
+      new BlobClient(
+        await blockBlobClient.withVersion(first.versionId!).generateSasUrl({
+          permissions: BlobSASPermissions.parse(permissions),
+          expiresOn: new Date(Date.now() + 60 * 60 * 1000)
+        }),
+        newPipeline(new AnonymousCredential(), { retryOptions: { maxTries: 1 } })
+      );
+
+    await assert.rejects(
+      (await sasClientWith("d")).delete(),
+      (err: RestError) =>
+        err.statusCode === 403 &&
+        err.code === "AuthorizationPermissionMismatch"
+    );
+    assert.deepStrictEqual(
+      (await listBlobVersions(containerClient, blobName)).map(
+        (v) => v.versionId
+      ),
+      [first.versionId, second.versionId]
+    );
+
+    await (await sasClientWith("x")).delete();
+    assert.deepStrictEqual(
+      (await listBlobVersions(containerClient, blobName)).map(
+        (v) => v.versionId
+      ),
+      [second.versionId]
+    );
+    assert.strictEqual(
+      await bodyToString(await blockBlobClient.download(), 2),
+      "v2"
+    );
+  });
+
+  // Signing formats before 2018-11-09 sign neither the resource nor the
+  // snapshot time or version ID, so they could not bind a snapshot or version
+  // SAS to what it names.  The same token for the blob itself is accepted,
+  // which shows it is otherwise well formed.
+  it("a SAS for a snapshot or version needs a 2018-11-09 signature @loki", async () => {
+    const first = await blockBlobClient.upload("v1", 2);
+    const snapshot = (await blockBlobClient.createSnapshot()).snapshot!;
+    await blockBlobClient.upload("v2", 2);
+    const expiryTime =
+      new Date(Date.now() + 60 * 60 * 1000).toISOString().split(".")[0] + "Z";
+    const legacyClient = (resource: BlobSASResourceType, url: string) => {
+      const [sig] = generateBlobSASSignature(
+        {
+          version: "2017-11-09",
+          permissions: "r",
+          expiryTime,
+          containerName,
+          blobName,
+          signedResource: resource
+        },
+        resource,
+        EMULATOR_ACCOUNT_NAME,
+        Buffer.from(EMULATOR_ACCOUNT_KEY, "base64")
+      );
+      const sas = new URLSearchParams({
+        sv: "2017-11-09",
+        sr: resource,
+        sp: "r",
+        se: expiryTime,
+        sig
+      });
+      return new BlobClient(
+        `${url}${url.includes("?") ? "&" : "?"}${sas}`,
+        newPipeline(new AnonymousCredential(), { retryOptions: { maxTries: 1 } })
+      );
+    };
+
+    assert.strictEqual(
+      await bodyToString(
+        await legacyClient(BlobSASResourceType.Blob, blockBlobClient.url)
+          .download(),
+        2
+      ),
+      "v2"
+    );
+    for (const client of [
+      legacyClient(
+        BlobSASResourceType.BlobVersion,
+        blockBlobClient.withVersion(first.versionId!).url
+      ),
+      legacyClient(
+        BlobSASResourceType.BlobSnapshot,
+        blockBlobClient.withSnapshot(snapshot).url
+      )
+    ]) {
+      await assert.rejects(
+        client.download(),
+        (err: RestError) => err.statusCode === 403
+      );
+    }
+  });
+
+  // A snapshot SAS likewise grants the snapshot and not the base blob.
+  it("a SAS for a snapshot does not reach the base blob @loki", async () => {
+    await blockBlobClient.upload("v1", 2);
+    const snapshot = (await blockBlobClient.createSnapshot()).snapshot!;
+    await blockBlobClient.upload("v2", 2);
+    const sasClient = new BlockBlobClient(
+      await blockBlobClient.withSnapshot(snapshot).generateSasUrl({
+        permissions: BlobSASPermissions.parse("racwt"),
+        expiresOn: new Date(Date.now() + 60 * 60 * 1000)
+      }),
+      newPipeline(new AnonymousCredential(), { retryOptions: { maxTries: 1 } })
+    );
+
+    assert.strictEqual(await bodyToString(await sasClient.download(), 2), "v1");
+    await assert.rejects(
+      sasClient.setMetadata({ key: "value" }),
+      (err: RestError) =>
+        err.statusCode === 403 &&
+        err.code === "AuthorizationResourceTypeMismatch"
+    );
+    assert.deepStrictEqual(
+      (await blockBlobClient.getProperties()).metadata,
+      {}
+    );
+  });
+
+  // What reads a snapshot through a snapshot SAS reads the snapshot: its
+  // committed blocks, none of the blocks staged on the base blob, and the
+  // page ranges of a page blob snapshot.
+  it("a SAS for a snapshot reads its block list and page ranges @loki", async () => {
+    await blockBlobClient.stageBlock(base64encode("1"), "a", 1);
+    await blockBlobClient.commitBlockList([base64encode("1")]);
+    const blockSnapshot = (await blockBlobClient.createSnapshot()).snapshot!;
+    await blockBlobClient.stageBlock(base64encode("2"), "b", 1);
+    const blockSasClient = new BlockBlobClient(
+      await blockBlobClient.withSnapshot(blockSnapshot).generateSasUrl({
+        permissions: BlobSASPermissions.parse("r"),
+        expiresOn: new Date(Date.now() + 60 * 60 * 1000)
+      }),
+      newPipeline(new AnonymousCredential(), { retryOptions: { maxTries: 1 } })
+    );
+    for (const listType of ["committed", "all"] as const) {
+      const list = await blockSasClient.getBlockList(listType);
+      assert.deepStrictEqual(
+        list.committedBlocks!.map((block) => block.name),
+        [base64encode("1")]
+      );
+      assert.deepStrictEqual(list.uncommittedBlocks ?? [], []);
+    }
+
+    const pageBlobClient = containerClient.getPageBlobClient(
+      getUniqueName("page")
+    );
+    await pageBlobClient.create(1024);
+    await pageBlobClient.uploadPages("a".repeat(512), 0, 512);
+    const pageSnapshot = (await pageBlobClient.createSnapshot()).snapshot!;
+    await pageBlobClient.uploadPages("b".repeat(512), 512, 512);
+    const pageSasClient = new PageBlobClient(
+      await pageBlobClient.withSnapshot(pageSnapshot).generateSasUrl({
+        permissions: BlobSASPermissions.parse("r"),
+        expiresOn: new Date(Date.now() + 60 * 60 * 1000)
+      }),
+      newPipeline(new AnonymousCredential(), { retryOptions: { maxTries: 1 } })
+    );
+    // Only the first page, which the snapshot holds; the second was written
+    // to the base blob after it.  The SDK reports a range's last byte as
+    // count.
+    const ranges = await pageSasClient.getPageRanges();
+    assert.deepStrictEqual(ranges.pageRange, [{ offset: 0, count: 511 }]);
+  });
+
   it("copies from a SAS URL for a version @loki", async () => {
     const first = await blockBlobClient.upload("v1", 2);
     await blockBlobClient.upload("v2", 2);
@@ -1115,4 +1330,47 @@ describe("BlockBlobVersioningAPIs - user delegation SAS @loki", () => {
       );
     });
   }
+
+  it("a writable user delegation SAS for a snapshot does not reach the base blob @loki", async () => {
+    const containerClient = serviceClient.getContainerClient(
+      getUniqueName("container")
+    );
+    await containerClient.create();
+    const blobName = getUniqueName("blob");
+    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+    await blockBlobClient.upload("v1", 2);
+    const snapshot = (await blockBlobClient.createSnapshot()).snapshot!;
+
+    const expiresOn = new Date(Date.now() + 60 * 60 * 1000);
+    const userDelegationKey = await serviceClient.getUserDelegationKey(
+      new Date(Date.now() - 60 * 60 * 1000),
+      expiresOn
+    );
+    const sas = generateBlobSASQueryParameters(
+      {
+        containerName: containerClient.containerName,
+        blobName,
+        snapshotTime: snapshot,
+        permissions: BlobSASPermissions.parse("rw"),
+        expiresOn
+      },
+      userDelegationKey,
+      EMULATOR_ACCOUNT_NAME
+    );
+    const sasClient = new BlobClient(
+      `${blockBlobClient.withSnapshot(snapshot).url}&${sas}`,
+      newPipeline(new AnonymousCredential(), { retryOptions: { maxTries: 1 } })
+    );
+
+    await assert.rejects(
+      sasClient.setMetadata({ key: "value" }),
+      (err: RestError) =>
+        err.statusCode === 403 &&
+        err.code === "AuthorizationResourceTypeMismatch"
+    );
+    assert.deepStrictEqual(
+      (await blockBlobClient.getProperties()).metadata,
+      {}
+    );
+  });
 });
